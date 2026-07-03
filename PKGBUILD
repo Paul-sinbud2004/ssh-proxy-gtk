@@ -1,6 +1,6 @@
 # Maintainer: Paul <paul.sinbud2004@gmail.com>
 pkgname=ssh-proxy-gtk
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="SSH Port Forwarding GUI application with GTK4"
 arch=('x86_64')
