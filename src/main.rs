@@ -3,10 +3,12 @@ use gtk4::{Application, ApplicationWindow, Box, Button, Entry, Label, ListBox, L
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ConnectionHistory {
@@ -143,6 +145,64 @@ fn get_config_path() -> PathBuf {
     path.push(".ssh_proxy_gtk");
     path.push("config.json");
     path
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        return format!("{}/{}", home.to_string_lossy(), rest);
+    }
+    path.to_string()
+}
+
+/// 构造 `ssh -D` 命令。
+/// 三个要点（都是为了避免把整个桌面拖死）：
+/// 1. stdio 全部丢弃：子进程绝不继承会话的控制终端，也就不会去 /dev/tty 上提问把人挂住；
+/// 2. process_group(0)：独立进程组，断开时能一次干掉 sshpass 及其 ssh 子进程，不留孤儿；
+/// 3. 失败快速返回：ExitOnForwardFailure + BatchMode/accept-new，避免 ssh 静默等待。
+fn ssh_command(
+    use_key_auth: bool,
+    key_path: &str,
+    password: &str,
+    local_port: u16,
+    ssh_port: u16,
+    username: &str,
+    server_address: &str,
+) -> Command {
+    let mut cmd = if use_key_auth {
+        let mut c = Command::new("ssh");
+        c.arg("-i").arg(expand_tilde(key_path));
+        // 密钥方式：完全不交互，避免 ssh 卡在密码/指纹提示上
+        c.arg("-o").arg("BatchMode=yes");
+        c
+    } else {
+        let mut c = Command::new("sshpass");
+        // -e + 环境变量：密码不进 argv，ps 里看不到
+        c.env("SSHPASS", password).arg("-e").arg("ssh");
+        c
+    };
+
+    cmd.arg("-D")
+        .arg(local_port.to_string())
+        .arg("-p")
+        .arg(ssh_port.to_string())
+        .arg("-N")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg(format!("{}@{}", username, server_address))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    cmd
 }
 
 fn load_history() -> ConnectionHistory {
@@ -451,12 +511,15 @@ fn build_ui(app: &Application) {
     let ssh_process = Arc::new(Mutex::new(None::<std::process::Child>));
     let status_message = Arc::new(Mutex::new(None::<String>));
     let status_message_clone = status_message.clone();
+    let ssh_process_for_timer = ssh_process.clone();
     let connect_button_clone_for_timer = connect_button.clone();
     let disconnect_button_clone_for_timer = disconnect_button.clone();
     let status_text_buffer_clone_for_timer = status_text_buffer.clone();
 
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        if let Some(msg) = status_message.lock().unwrap().take() {
+    gtk4::glib::timeout_add_local(Duration::from_millis(300), move || {
+        // 先在局部变量里 take()：原来的写法会把 Mutex 守卫一直持有到整个 if 块结束（跨 UI 调用持锁）
+        let pending = status_message.lock().unwrap().take();
+        if let Some(msg) = pending {
             status_text_buffer_clone_for_timer.set_text(&msg);
             let t = Translations::get(*lang_clone1.lock().unwrap());
             if msg.starts_with(t.connected.split('\n').next().unwrap_or("")) {
@@ -467,6 +530,25 @@ fn build_ui(app: &Application) {
                 disconnect_button_clone_for_timer.set_sensitive(false);
             }
         }
+
+        // 巡检 ssh 子进程：掉线或被杀后自动回到未连接状态。
+        // try_lock/try_wait 都不阻塞，主循环永远不会卡在这里。
+        let mut exited = false;
+        if let Ok(mut guard) = ssh_process_for_timer.try_lock() {
+            if let Some(child) = guard.as_mut() {
+                if let Ok(Some(_status)) = child.try_wait() {
+                    *guard = None;
+                    exited = true;
+                }
+            }
+        }
+        if exited {
+            let t = Translations::get(*lang_clone1.lock().unwrap());
+            status_text_buffer_clone_for_timer.set_text(t.disconnected);
+            connect_button_clone_for_timer.set_sensitive(true);
+            disconnect_button_clone_for_timer.set_sensitive(false);
+        }
+
         gtk4::glib::ControlFlow::Continue
     });
 
@@ -482,6 +564,10 @@ fn build_ui(app: &Application) {
     let history_clone = history;
 
     connect_button.connect_clicked(move |button| {
+        // 已连接/正在连接时忽略重复点击，避免反复 fork ssh
+        if ssh_process_clone.lock().unwrap().is_some() {
+            return;
+        }
         let server_address = server_address_entry_clone.text().to_string();
         let ssh_port_str = ssh_port_entry_clone.text().to_string();
         let username = username_entry_clone.text().to_string();
@@ -559,40 +645,34 @@ fn build_ui(app: &Application) {
         let lang_clone5 = lang_clone2.clone();
 
         thread::spawn(move || {
-            let result = if use_key_auth {
-                let expanded_key_path = if key_path.starts_with("~") {
-                    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-                    key_path.replacen("~", home.to_str().unwrap_or("."), 1)
-                } else {
-                    key_path
-                };
-                
-                Command::new("ssh")
-                    .arg("-i")
-                    .arg(&expanded_key_path)
-                    .arg("-D")
-                    .arg(format!("{}", local_port))
-                    .arg("-p")
-                    .arg(format!("{}", ssh_port))
-                    .arg("-N")
-                    .arg(format!("{}@{}", username, server_address))
-                    .spawn()
-            } else {
-                Command::new("sshpass")
-                    .arg("-p")
-                    .arg(&password)
-                    .arg("ssh")
-                    .arg("-D")
-                    .arg(format!("{}", local_port))
-                    .arg("-p")
-                    .arg(format!("{}", ssh_port))
-                    .arg("-N")
-                    .arg(format!("{}@{}", username, server_address))
-                    .spawn()
-            };
+            // spawn 等阻塞操作全部在工作线程里完成，GTK 主循环不参与
+            let spawned = ssh_command(
+                use_key_auth,
+                &key_path,
+                &password,
+                local_port,
+                ssh_port,
+                &username,
+                &server_address,
+            )
+            .spawn();
 
-            match result {
-                Ok(child) => {
+            match spawned {
+                Ok(mut child) => {
+                    // 稍等一下看它是否立刻退出（认证失败/端口被占用/主机不可达），
+                    // 否则 UI 会一直显示“已连接”，而实际上隧道根本没起来
+                    thread::sleep(Duration::from_millis(400));
+                    if let Ok(Some(status)) = child.try_wait() {
+                        let t = Translations::get(*lang_clone5.lock().unwrap());
+                        let detail = format!(
+                            "ssh 立即退出({})，检查本地端口 {} 是否被占用、密钥或密码是否正确",
+                            status, local_port
+                        );
+                        *status_message_clone2.lock().unwrap() =
+                            Some(t.connection_failed.replace("{}", &detail));
+                        return;
+                    }
+
                     *ssh_process_clone2.lock().unwrap() = Some(child);
                     let t = Translations::get(*lang_clone5.lock().unwrap());
                     let auth_method = if use_key_auth { t.key_auth } else { t.password_auth };
@@ -616,11 +696,29 @@ fn build_ui(app: &Application) {
     let connect_button_clone_for_disconnect = connect_button.clone();
 
     disconnect_button.connect_clicked(move |button| {
-        if let Some(mut child) = ssh_process_clone.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let taken = ssh_process_clone.lock().unwrap().take();
+        if let Some(mut child) = taken {
+            // 关键修复：原来在主线程里 child.wait() 会阻塞 GTK 主循环。
+            // 现在整组终止 + 回收全放到工作线程，UI 立刻响应。
+            thread::spawn(move || {
+                let pid = child.id();
+                // 负 PID = 整个进程组：一次干掉 sshpass 及其 ssh 子进程，不留占着 -D 端口的孤儿
+                let _ = Command::new("kill")
+                    .arg("-TERM")
+                    .arg("--")
+                    .arg(format!("-{}", pid))
+                    .status();
+                thread::sleep(Duration::from_millis(800));
+                let _ = Command::new("kill")
+                    .arg("-KILL")
+                    .arg("--")
+                    .arg(format!("-{}", pid))
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait(); // 回收僵尸进程
+            });
         }
-        
+
         button.set_sensitive(false);
         connect_button_clone_for_disconnect.set_sensitive(true);
         let t = Translations::get(*lang_clone3.lock().unwrap());
